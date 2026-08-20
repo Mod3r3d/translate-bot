@@ -15,25 +15,29 @@ import keyboard
 from PIL import Image, ImageEnhance
 from PyQt6 import QtCore, QtGui, QtWidgets
 import google.generativeai as genai
+from dotenv import load_dotenv
 
 import warnings
 warnings.filterwarnings("ignore")
 
 # ==========================================================
-# 1. CẤU HÌNH GEMINI VỚI "LỆNH HỆ THỐNG" (SYSTEM INSTRUCTION)
+# CẤU HÌNH BẢO MẬT: TỰ ĐỘNG LẤY API KEY TỪ FILE .env
 # ==========================================================
-GEMINI_API_KEY = "AQ.Ab8RN6KxAJ3ioGCrzL1rz1Bku7hfzjIFKzRNFm_YcrwXmiT0Mw"
+load_dotenv()
+GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "")
 
 if GEMINI_API_KEY and len(GEMINI_API_KEY) > 10:
     genai.configure(api_key=GEMINI_API_KEY)
     
-    # Ép AI tuân thủ luật lệ tuyệt đối bằng system_instruction
     sys_instruct = (
-        "Bạn là một cỗ máy dịch thuật game RPG giả tưởng. Bạn chỉ nhận đầu vào là văn bản OCR (có thể sai chính tả). "
-        "LUẬT LỆ TỐI THƯỢNG:\n"
-        "1. Tự động sửa lỗi chính tả tiếng Anh do máy quét sai trước khi dịch.\n"
-        "2. Dịch sang tiếng Việt mượt mà, văn phong tiểu thuyết/game.\n"
-        "3. CHỈ TRẢ VỀ CHUỖI TIẾNG VIỆT ĐÃ DỊCH. Tuyệt đối không giải thích, không bình luận, không bọc trong dấu ngoặc kép."
+        "Bạn là một dịch giả game RPG giả tưởng chuyên nghiệp. "
+        "Đầu vào là văn bản OCR từ game (thỉnh thoảng có lẫn chữ rác ở viền màn hình như 'LOG', 'AUTO', hoặc số đếm). "
+        "NHIỆM VỤ TỐI THƯỢNG:\n"
+        "1. CHỦ ĐỘNG BỎ QUA các ký tự rác vô nghĩa.\n"
+        "2. Tự động sửa lỗi chính tả tiếng Anh do OCR (ví dụ: 'witn' -> 'with', 'propneaes' -> 'prophecies').\n"
+        "3. DỊCH THOÁT Ý THEO NGỮ CẢNH: Không dịch word-by-word. (Ví dụ: 'make sense' / 'in that sense' dịch là 'có lý' / 'theo nghĩa đó', không dịch là 'cảm nhận').\n"
+        "4. Văn phong tự nhiên, mượt mà đậm chất tiểu thuyết kỳ ảo.\n"
+        "5. CHỈ TRẢ VỀ BẢN DỊCH TIẾNG VIỆT. Tuyệt đối không giải thích, không bình luận."
     )
     
     gemini_model = genai.GenerativeModel(
@@ -71,8 +75,8 @@ def ai_smart_translate(text: str) -> str:
     
     try:
         response = gemini_model.generate_content(
-            text, # Chỉ cần truyền mỗi text vào, AI đã có sẵn luật lệ ở System Instruction
-            generation_config={"temperature": 0.05}, # Nhiệt độ gần 0 để AI cực kỳ nghiêm túc, không chế chữ
+            text, 
+            generation_config={"temperature": 0.15}, 
             safety_settings=safety_settings
         )
         if response.parts:
@@ -94,6 +98,11 @@ class SubtitleWorker(QtCore.QThread):
         self.region = None
         self.accumulated_text = ""
         self.last_translated = ""
+        
+        # Biến phục vụ logic chống Spam (Debounce)
+        self.accumulated_text_raw = ""
+        self.last_change_time = 0
+        
         self.cache = {}
         self.lock = Lock()
         self.req_id = 0
@@ -103,6 +112,7 @@ class SubtitleWorker(QtCore.QThread):
             self.region = r
             self.accumulated_text = ""
             self.last_translated = ""
+            self.accumulated_text_raw = ""
 
     def set_paused(self, state: bool):
         self.paused = state
@@ -110,10 +120,8 @@ class SubtitleWorker(QtCore.QThread):
     def clean_text(self, text: str) -> str:
         text = re.sub(r'\d+:\d+\s*/\s*\d+:\d+', '', text)
         text = re.sub(r'\d+\s*/\s*\d+', '', text)
-        # Bộ lọc rác mạnh tay hơn
         text = re.sub(r'[^a-zA-Z0-9\s.,!?\'"-]', '', text) 
         text = text.replace('\n', ' ').replace('\r', ' ')
-        
         text = text.strip()
         if text and text[0].islower():
             text = text[0].upper() + text[1:]
@@ -150,12 +158,12 @@ class SubtitleWorker(QtCore.QThread):
                        self.are_words_similar(acc_words[acc_i + match_len], scr_words[scr_start + match_len])):
                     match_len += 1
                 
-                if match_len >= 3 and match_len > max_overlap:
+                if match_len >= 2 and match_len > max_overlap:
                     max_overlap = match_len
                     best_acc_idx = acc_i
                     best_scr_idx = scr_start
 
-        if max_overlap >= 3:
+        if max_overlap >= 2:
             merged_list = acc_words[:best_acc_idx] + scr_words[best_scr_idx:]
             return " ".join(merged_list)
         else:
@@ -194,35 +202,47 @@ class SubtitleWorker(QtCore.QThread):
                     sct_img = sct.grab(target_box)
                     raw_pil = Image.frombytes("RGB", sct_img.size, sct_img.bgra, "raw", "BGRX")
                     
+                    # 1. NHỊ PHÂN HÓA HÌNH ẢNH (Binarization) KHỬ RÁC
                     gray_pil = raw_pil.convert('L')
-                    enhanced_pil = ImageEnhance.Contrast(gray_pil).enhance(2.5)
+                    enhanced_pil = ImageEnhance.Contrast(gray_pil).enhance(3.0)
+                    # Ép mọi điểm mờ/nút bấm thành đen (0), chỉ chữ sáng (>160) mới thành trắng (255)
+                    binary_pil = enhanced_pil.point(lambda p: 255 if p > 160 else 0)
 
-                    ocr_result = loop.run_until_complete(winocr.recognize_pil(enhanced_pil, lang='en'))
+                    ocr_result = loop.run_until_complete(winocr.recognize_pil(binary_pil, lang='en'))
                     raw_text = ocr_result.text if hasattr(ocr_result, 'text') else str(ocr_result)
                     clean_screen = self.clean_text(raw_text)
 
-                    if len(clean_screen) >= 4:
-                        full_sentence = self.merge_rolling_dialogue(self.accumulated_text, clean_screen)
-                        self.accumulated_text = full_sentence
-
-                        if full_sentence != self.last_translated:
-                            self.last_translated = full_sentence
-                            self.req_id += 1
-                            
-                            Thread(
-                                target=self.translate_task,
-                                args=(full_sentence, self.req_id),
-                                daemon=True
-                            ).start()
+                    now = time.time()
+                    if len(clean_screen) >= 3:
+                        # 2. CHỐNG SPAM (Debounce 0.25s)
+                        if clean_screen != self.accumulated_text_raw:
+                            self.accumulated_text_raw = clean_screen
+                            self.last_change_time = now
+                        else:
+                            # Đợi chữ trên màn hình dừng hẳn 0.25s rồi mới dịch
+                            if now - self.last_change_time >= 0.25:
+                                full_sentence = self.merge_rolling_dialogue(self.accumulated_text, clean_screen)
+                                
+                                if full_sentence != self.last_translated:
+                                    self.accumulated_text = full_sentence
+                                    self.last_translated = full_sentence
+                                    self.req_id += 1
+                                    
+                                    Thread(
+                                        target=self.translate_task,
+                                        args=(full_sentence, self.req_id),
+                                        daemon=True
+                                    ).start()
                     else:
                         if self.accumulated_text:
                             self.accumulated_text = ""
+                            self.accumulated_text_raw = ""
                             self.last_translated = ""
                             self.new_subtitle_ready.emit("")
                 except Exception:
                     pass
 
-                time.sleep(0.03)
+                time.sleep(0.04)
 
         loop.close()
 
@@ -460,7 +480,7 @@ class SubtitleViewer(QtWidgets.QWidget):
         text_rect = QtCore.QRect(24, top_offset, w - 48, h - top_offset - 14)
         flags = QtCore.Qt.AlignmentFlag.AlignCenter | QtCore.Qt.TextFlag.TextWordWrap
 
-        # Viền bóng đen
+        # Bóng viền đen
         painter.setPen(QtGui.QColor(0, 0, 0, 255))
         for dx, dy in [(-1, 0), (1, 0), (0, -1), (0, 1), (-2, 2), (2, 2)]:
             painter.drawText(text_rect.adjusted(dx, dy, dx, dy), flags, self.translated_text)
