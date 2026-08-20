@@ -1,0 +1,8 @@
+PyQt6
+mss
+winocr
+keyboard
+Pillow
+numpy
+google-generativeai
+python-dotenv
