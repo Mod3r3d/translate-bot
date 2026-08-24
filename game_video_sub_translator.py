@@ -35,10 +35,7 @@ except Exception:
 # CẤU HÌNH BẢO MẬT & API KEY
 # ==========================================================
 load_dotenv(encoding="utf-8-sig")
-env_key = os.getenv("GEMINI_API_KEY", "").strip(' \t\n\r"\'')
-
-HARDCODED_API_KEY = "AQ.Ab8RN6J3XxIIPjW0i3WIP3dxnBGqLVWMRiQkD4onJVGpxpJfgg"
-GEMINI_API_KEY = HARDCODED_API_KEY if HARDCODED_API_KEY else env_key
+GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "").strip(' \t\n\r"\'')
 
 if GEMINI_API_KEY and len(GEMINI_API_KEY) > 10:
     genai.configure(api_key=GEMINI_API_KEY)
