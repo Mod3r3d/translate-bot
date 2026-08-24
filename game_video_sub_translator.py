@@ -8,7 +8,6 @@ import urllib.request
 import urllib.parse
 import difflib
 from threading import Thread, Lock
-import numpy as np
 import mss
 import winocr
 import keyboard
@@ -21,10 +20,25 @@ import warnings
 warnings.filterwarnings("ignore")
 
 # ==========================================================
-# CẤU HÌNH BẢO MẬT: TỰ ĐỘNG LẤY API KEY TỪ FILE .env
+# FIX LỖI TỌA ĐỘ KHI WINDOWS BẬT SCALE (125%, 150%)
 # ==========================================================
-load_dotenv()
-GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "")
+import ctypes
+try:
+    ctypes.windll.shcore.SetProcessDpiAwareness(2)
+except Exception:
+    try:
+        ctypes.windll.user32.SetProcessDPIAware()
+    except Exception:
+        pass
+
+# ==========================================================
+# CẤU HÌNH BẢO MẬT & API KEY
+# ==========================================================
+load_dotenv(encoding="utf-8-sig")
+env_key = os.getenv("GEMINI_API_KEY", "").strip(' \t\n\r"\'')
+
+HARDCODED_API_KEY = "AQ.Ab8RN6J3XxIIPjW0i3WIP3dxnBGqLVWMRiQkD4onJVGpxpJfgg"
+GEMINI_API_KEY = HARDCODED_API_KEY if HARDCODED_API_KEY else env_key
 
 if GEMINI_API_KEY and len(GEMINI_API_KEY) > 10:
     genai.configure(api_key=GEMINI_API_KEY)
@@ -35,7 +49,7 @@ if GEMINI_API_KEY and len(GEMINI_API_KEY) > 10:
         "NHIỆM VỤ TỐI THƯỢNG:\n"
         "1. CHỦ ĐỘNG BỎ QUA các ký tự rác vô nghĩa.\n"
         "2. Tự động sửa lỗi chính tả tiếng Anh do OCR (ví dụ: 'witn' -> 'with', 'propneaes' -> 'prophecies').\n"
-        "3. DỊCH THOÁT Ý THEO NGỮ CẢNH: Không dịch word-by-word. (Ví dụ: 'make sense' / 'in that sense' dịch là 'có lý' / 'theo nghĩa đó', không dịch là 'cảm nhận').\n"
+        "3. DỊCH THOÁT Ý THEO NGỮ CẢNH: Không dịch word-by-word. (Ví dụ: 'make sense' / 'in that sense' dịch là 'có lý' / 'theo nghĩa đó').\n"
         "4. Văn phong tự nhiên, mượt mà đậm chất tiểu thuyết kỳ ảo.\n"
         "5. CHỈ TRẢ VỀ BẢN DỊCH TIẾNG VIỆT. Tuyệt đối không giải thích, không bình luận."
     )
@@ -44,27 +58,41 @@ if GEMINI_API_KEY and len(GEMINI_API_KEY) > 10:
         model_name='gemini-1.5-flash',
         system_instruction=sys_instruct
     )
+    print("[AI] Da ket noi thanh cong Google Gemini Flash!")
 else:
     gemini_model = None
+    print("[AI] Chua nhan duoc API Key, dung Google Translate du phong.")
 
 def fast_translate_fallback(text: str) -> str:
     if not text.strip():
         return ""
     try:
-        url = "https://translate.googleapis.com/translate_a/single?client=gtx&sl=en&tl=vi&dt=t&q=" + urllib.parse.quote(text)
+        url = "https://clients5.google.com/translate_a/t?client=dict-chrome-ex&sl=en&tl=vi&q=" + urllib.parse.quote(text)
         req = urllib.request.Request(url, headers={'User-Agent': 'Mozilla/5.0'})
-        with urllib.request.urlopen(req, timeout=1.5) as resp:
+        with urllib.request.urlopen(req, timeout=3.0) as resp:
             data = json.loads(resp.read().decode('utf-8'))
-            translated_parts = [part[0] for part in data[0] if part and part[0]]
-            return "".join(translated_parts)
+            if isinstance(data, list):
+                return " ".join(data)
+            elif isinstance(data, str):
+                return data
     except Exception:
-        return text
+        try:
+            url = "https://translate.googleapis.com/translate_a/single?client=gtx&sl=en&tl=vi&dt=t&q=" + urllib.parse.quote(text)
+            req = urllib.request.Request(url, headers={'User-Agent': 'Mozilla/5.0'})
+            with urllib.request.urlopen(req, timeout=3.0) as resp:
+                data = json.loads(resp.read().decode('utf-8'))
+                parts = [part[0] for part in data[0] if part and part[0]]
+                return "".join(parts)
+        except Exception:
+            pass
+    return text
 
 def ai_smart_translate(text: str) -> str:
     if not text.strip():
         return ""
     if not gemini_model:
-        return "🤖 " + fast_translate_fallback(text)
+        # Đã xóa "🤖 " +
+        return fast_translate_fallback(text)
         
     safety_settings = [
         {"category": "HARM_CATEGORY_HARASSMENT", "threshold": "BLOCK_NONE"},
@@ -81,11 +109,14 @@ def ai_smart_translate(text: str) -> str:
         )
         if response.parts:
             result = response.text.strip().strip('"').strip("'")
-            return "✨ " + result
+            # Đã xóa "✨ " +
+            return result
         else:
-            return "🤖 " + fast_translate_fallback(text)
+            # Đã xóa "🤖 " +
+            return fast_translate_fallback(text)
     except Exception as e:
-        return "🤖 " + fast_translate_fallback(text)
+        # Đã xóa "🤖 " +
+        return fast_translate_fallback(text)
 
 
 class SubtitleWorker(QtCore.QThread):
@@ -96,10 +127,10 @@ class SubtitleWorker(QtCore.QThread):
         self.running = True
         self.paused = False
         self.region = None
+        
         self.accumulated_text = ""
         self.last_translated = ""
         
-        # Biến phục vụ logic chống Spam (Debounce)
         self.accumulated_text_raw = ""
         self.last_change_time = 0
         
@@ -118,11 +149,13 @@ class SubtitleWorker(QtCore.QThread):
         self.paused = state
 
     def clean_text(self, text: str) -> str:
+        # Lọc rác cực mạnh
         text = re.sub(r'\d+:\d+\s*/\s*\d+:\d+', '', text)
         text = re.sub(r'\d+\s*/\s*\d+', '', text)
-        text = re.sub(r'[^a-zA-Z0-9\s.,!?\'"-]', '', text) 
+        text = re.sub(r'\b(LOG|AUTO|SKIP|Mage)\b', '', text, flags=re.IGNORECASE)
+        text = re.sub(r'[^a-zA-Z0-9\s.,!?\'"\-]', '', text) 
         text = text.replace('\n', ' ').replace('\r', ' ')
-        text = text.strip()
+        text = re.sub(r'\s+', ' ', text).strip()
         if text and text[0].islower():
             text = text[0].upper() + text[1:]
         return text
@@ -158,18 +191,26 @@ class SubtitleWorker(QtCore.QThread):
                        self.are_words_similar(acc_words[acc_i + match_len], scr_words[scr_start + match_len])):
                     match_len += 1
                 
-                if match_len >= 2 and match_len > max_overlap:
+                if match_len > max_overlap:
                     max_overlap = match_len
                     best_acc_idx = acc_i
                     best_scr_idx = scr_start
 
-        if max_overlap >= 2:
+        # Nếu có từ trùng lặp
+        if max_overlap >= 1:
             merged_list = acc_words[:best_acc_idx] + scr_words[best_scr_idx:]
             return " ".join(merged_list)
         else:
-            if accumulated.rstrip().endswith(('.', '!', '?')) and current_screen != accumulated:
+            # SỬA LỖI MẤT DÒNG ĐẦU:
+            # Nếu KHÔNG có từ trùng lặp nào, phải kiểm tra xem câu cũ đã chấm dứt chưa.
+            # Tránh việc OCR bị mất chữ đầu mà xóa luôn lịch sử câu thoại.
+            last_char = accumulated.rstrip()[-1] if accumulated.strip() else ""
+            if last_char not in ['.', '!', '?', '"', '”', '…', '>']:
+                # Câu lửng lơ chưa hết -> Ép nối tiếp câu mới vào
+                return accumulated + " " + current_screen
+            else:
+                # Nếu đã có dấu ngắt câu đàng hoàng -> Sang câu hoàn toàn mới
                 return current_screen
-            return current_screen
 
     def translate_task(self, text, current_id):
         if text in self.cache:
@@ -185,7 +226,7 @@ class SubtitleWorker(QtCore.QThread):
         loop = asyncio.new_event_loop()
         asyncio.set_event_loop(loop)
 
-        with mss.MSS() as sct:
+        with mss.mss() as sct:
             while self.running:
                 if self.paused or not self.region:
                     time.sleep(0.04)
@@ -202,47 +243,72 @@ class SubtitleWorker(QtCore.QThread):
                     sct_img = sct.grab(target_box)
                     raw_pil = Image.frombytes("RGB", sct_img.size, sct_img.bgra, "raw", "BGRX")
                     
-                    # 1. NHỊ PHÂN HÓA HÌNH ẢNH (Binarization) KHỬ RÁC
-                    gray_pil = raw_pil.convert('L')
+                    # Nâng cấp OCR: Phóng to hình x2 trước khi nhị phân
+                    w, h = raw_pil.size
+                    scaled_pil = raw_pil.resize((w * 2, h * 2), Image.Resampling.LANCZOS)
+                    
+                    gray_pil = scaled_pil.convert('L')
                     enhanced_pil = ImageEnhance.Contrast(gray_pil).enhance(3.0)
-                    # Ép mọi điểm mờ/nút bấm thành đen (0), chỉ chữ sáng (>160) mới thành trắng (255)
                     binary_pil = enhanced_pil.point(lambda p: 255 if p > 160 else 0)
 
-                    ocr_result = loop.run_until_complete(winocr.recognize_pil(binary_pil, lang='en'))
-                    raw_text = ocr_result.text if hasattr(ocr_result, 'text') else str(ocr_result)
+                    try:
+                        ocr_result = loop.run_until_complete(winocr.recognize_pil(binary_pil, lang='en-US'))
+                    except Exception:
+                        ocr_result = loop.run_until_complete(winocr.recognize_pil(binary_pil))
+
+                    raw_text = ""
+                    if isinstance(ocr_result, dict) and 'lines' in ocr_result:
+                        raw_text = " ".join([l.get('text', '') for l in ocr_result['lines'] if isinstance(l, dict)])
+                    elif hasattr(ocr_result, 'text'):
+                        raw_text = ocr_result.text
+                    else:
+                        raw_text = str(ocr_result)
+
                     clean_screen = self.clean_text(raw_text)
 
                     now = time.time()
                     if len(clean_screen) >= 3:
-                        # 2. CHỐNG SPAM (Debounce 0.25s)
-                        if clean_screen != self.accumulated_text_raw:
-                            self.accumulated_text_raw = clean_screen
+                        # SỬA LỖI MẤT CÂU KHI XUỐNG DÒNG:
+                        # Trước đây việc ghép câu (merge_rolling_dialogue) chỉ chạy
+                        # SAU KHI màn hình đứng yên 0.3s. Nhưng khi câu dài phải xuống
+                        # dòng, chữ luôn "đang chạy" (hiệu ứng gõ chữ) nên không bao giờ
+                        # đứng yên cho tới khi dòng đầu đã bị đẩy trôi khỏi vùng quét
+                        # -> mất chữ vĩnh viễn, không thể ghép lại được nữa.
+                        # => Ghép câu phải chạy NGAY MỖI FRAME (bắt kịp chữ trước khi nó
+                        # trôi mất), còn việc GỬI ĐI DỊCH thì vẫn đợi ổn định như cũ.
+                        merged_text = self.merge_rolling_dialogue(self.accumulated_text, clean_screen)
+
+                        if merged_text != self.accumulated_text:
+                            self.accumulated_text = merged_text
                             self.last_change_time = now
-                        else:
-                            # Đợi chữ trên màn hình dừng hẳn 0.25s rồi mới dịch
-                            if now - self.last_change_time >= 0.25:
-                                full_sentence = self.merge_rolling_dialogue(self.accumulated_text, clean_screen)
-                                
-                                if full_sentence != self.last_translated:
-                                    self.accumulated_text = full_sentence
-                                    self.last_translated = full_sentence
-                                    self.req_id += 1
-                                    
-                                    Thread(
-                                        target=self.translate_task,
-                                        args=(full_sentence, self.req_id),
-                                        daemon=True
-                                    ).start()
+
+                        self.accumulated_text_raw = clean_screen
+
+                        # Đợi 0.3s để đảm bảo chữ ngưng chạy rồi mới gửi đi dịch
+                        if now - self.last_change_time >= 0.30:
+                            full_sentence = self.accumulated_text
+
+                            if full_sentence != self.last_translated:
+                                print(f"[Text hoàn chỉnh]: {full_sentence}")
+                                self.last_translated = full_sentence
+                                self.req_id += 1
+
+                                self.new_subtitle_ready.emit("⏳ Đang dịch...")
+                                Thread(
+                                    target=self.translate_task,
+                                    args=(full_sentence, self.req_id),
+                                    daemon=True
+                                ).start()
                     else:
                         if self.accumulated_text:
                             self.accumulated_text = ""
                             self.accumulated_text_raw = ""
                             self.last_translated = ""
-                            self.new_subtitle_ready.emit("")
+                            self.new_subtitle_ready.emit("...")
                 except Exception:
                     pass
 
-                time.sleep(0.04)
+                time.sleep(0.06)
 
         loop.close()
 
@@ -282,11 +348,12 @@ class SnippingOverlay(QtWidgets.QWidget):
         if event.button() == QtCore.Qt.MouseButton.LeftButton and self.start_pos:
             rect = QtCore.QRect(self.start_pos, event.globalPosition().toPoint()).normalized()
             if rect.width() > 30 and rect.height() > 15:
+                ratio = self.screen().devicePixelRatio()
                 self.area_selected.emit({
-                    'top': int(rect.top()),
-                    'left': int(rect.left()),
-                    'width': int(rect.width()),
-                    'height': int(rect.height())
+                    'top': int(rect.top() * ratio),
+                    'left': int(rect.left() * ratio),
+                    'width': int(rect.width() * ratio),
+                    'height': int(rect.height() * ratio)
                 })
             self.close()
 
@@ -473,19 +540,35 @@ class SubtitleViewer(QtWidgets.QWidget):
             handle.lineTo(w - 2, h - 2)
             painter.drawPath(handle)
 
-        font = QtGui.QFont("Segoe UI", 16, QtGui.QFont.Weight.DemiBold)
-        font.setLetterSpacing(QtGui.QFont.SpacingType.AbsoluteSpacing, 0.5)
-        painter.setFont(font)
-        
-        text_rect = QtCore.QRect(24, top_offset, w - 48, h - top_offset - 14)
+        # =======================================================
+        # GIAO DIỆN TỰ ĐỘNG THU NHỎ FONT VÀ BẮT ĐẦU TỪ SIZE 17
+        # =======================================================
+        # Mở rộng text_rect để tối đa diện tích vẽ
+        text_rect = QtCore.QRect(10, top_offset + 2, w - 20, h - top_offset - 10)
         flags = QtCore.Qt.AlignmentFlag.AlignCenter | QtCore.Qt.TextFlag.TextWordWrap
 
-        # Bóng viền đen
+        font_size = 17  
+        font = QtGui.QFont("Segoe UI", font_size, QtGui.QFont.Weight.DemiBold)
+        font.setLetterSpacing(QtGui.QFont.SpacingType.AbsoluteSpacing, 0.5)
+        metrics = QtGui.QFontMetrics(font)
+        
+        # SỬA LỖI TRÀN CHỮ: Nếu chữ siêu dài, ép font size nhỏ dần xuống mức 9
+        while font_size > 9:
+            bound_rect = metrics.boundingRect(text_rect, flags, self.translated_text)
+            if bound_rect.height() <= text_rect.height() and bound_rect.width() <= text_rect.width():
+                break
+            font_size -= 1
+            font.setPointSize(font_size)
+            metrics = QtGui.QFontMetrics(font)
+
+        painter.setFont(font)
+        
+        # Bóng viền đen nổi bật
         painter.setPen(QtGui.QColor(0, 0, 0, 255))
-        for dx, dy in [(-1, 0), (1, 0), (0, -1), (0, 1), (-2, 2), (2, 2)]:
+        for dx, dy in [(-1, 0), (1, 0), (0, -1), (0, 1), (-1, -1), (1, 1), (-1, 1), (1, -1)]:
             painter.drawText(text_rect.adjusted(dx, dy, dx, dy), flags, self.translated_text)
 
-        # Chữ vàng sáng
+        # Thân chữ vàng sáng
         painter.setPen(QtGui.QColor(255, 238, 88))
         painter.drawText(text_rect, flags, self.translated_text)
 
