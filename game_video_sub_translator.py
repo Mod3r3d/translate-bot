@@ -88,8 +88,7 @@ def ai_smart_translate(text: str) -> str:
     if not text.strip():
         return ""
     if not gemini_model:
-        # Đã xóa "🤖 " +
-        return fast_translate_fallback(text)
+        return "🤖 " + fast_translate_fallback(text)
         
     safety_settings = [
         {"category": "HARM_CATEGORY_HARASSMENT", "threshold": "BLOCK_NONE"},
@@ -104,16 +103,12 @@ def ai_smart_translate(text: str) -> str:
             generation_config={"temperature": 0.15}, 
             safety_settings=safety_settings
         )
-        if response.parts:
+        if response.text:
             result = response.text.strip().strip('"').strip("'")
-            # Đã xóa "✨ " +
-            return result
-        else:
-            # Đã xóa "🤖 " +
-            return fast_translate_fallback(text)
-    except Exception as e:
-        # Đã xóa "🤖 " +
-        return fast_translate_fallback(text)
+            return "✨ " + result
+        return "🤖 " + fast_translate_fallback(text)
+    except Exception:
+        return "🤖 " + fast_translate_fallback(text)
 
 
 class SubtitleWorker(QtCore.QThread):
@@ -166,11 +161,17 @@ class SubtitleWorker(QtCore.QThread):
             return True
         return difflib.SequenceMatcher(None, w1_clean, w2_clean).ratio() >= 0.85
 
-    def merge_rolling_dialogue(self, accumulated: str, current_screen: str) -> str:
+    def merge_rolling_dialogue(self, accumulated: str, current_screen: str):
+        """
+        Trả về (văn_bản_đã_ghép, is_new_sentence).
+        is_new_sentence = True nghĩa là current_screen là một câu thoại HOÀN TOÀN
+        MỚI, không liên quan gì tới 'accumulated' -> nơi gọi hàm này cần kiểm tra
+        xem câu cũ đã được gửi đi dịch chưa, tránh bị mất câu (xem chỗ gọi trong run()).
+        """
         if not accumulated:
-            return current_screen
+            return current_screen, False
         if not current_screen:
-            return accumulated
+            return accumulated, False
 
         acc_words = accumulated.split()
         scr_words = current_screen.split()
@@ -196,7 +197,7 @@ class SubtitleWorker(QtCore.QThread):
         # Nếu có từ trùng lặp
         if max_overlap >= 1:
             merged_list = acc_words[:best_acc_idx] + scr_words[best_scr_idx:]
-            return " ".join(merged_list)
+            return " ".join(merged_list), False
         else:
             # SỬA LỖI MẤT DÒNG ĐẦU:
             # Nếu KHÔNG có từ trùng lặp nào, phải kiểm tra xem câu cũ đã chấm dứt chưa.
@@ -204,10 +205,10 @@ class SubtitleWorker(QtCore.QThread):
             last_char = accumulated.rstrip()[-1] if accumulated.strip() else ""
             if last_char not in ['.', '!', '?', '"', '”', '…', '>']:
                 # Câu lửng lơ chưa hết -> Ép nối tiếp câu mới vào
-                return accumulated + " " + current_screen
+                return accumulated + " " + current_screen, False
             else:
                 # Nếu đã có dấu ngắt câu đàng hoàng -> Sang câu hoàn toàn mới
-                return current_screen
+                return current_screen, True
 
     def translate_task(self, text, current_id):
         if text in self.cache:
@@ -273,7 +274,25 @@ class SubtitleWorker(QtCore.QThread):
                         # -> mất chữ vĩnh viễn, không thể ghép lại được nữa.
                         # => Ghép câu phải chạy NGAY MỖI FRAME (bắt kịp chữ trước khi nó
                         # trôi mất), còn việc GỬI ĐI DỊCH thì vẫn đợi ổn định như cũ.
-                        merged_text = self.merge_rolling_dialogue(self.accumulated_text, clean_screen)
+                        merged_text, is_new_sentence = self.merge_rolling_dialogue(self.accumulated_text, clean_screen)
+
+                        # SỬA LỖI BỎ QUA CÂU KHI GAME Ở CHẾ ĐỘ AUTO CHUYỂN CÂU QUÁ NHANH:
+                        # Nếu phát hiện ranh giới sang một câu thoại HOÀN TOÀN MỚI (không
+                        # còn từ nào trùng với câu cũ), nhưng câu cũ vẫn CHƯA từng được gửi
+                        # đi dịch (do chưa kịp đứng yên đủ 0.30s trước khi bị ghi đè) thì
+                        # phải dịch ngay câu cũ đó trước khi cho phép thay bằng câu mới -
+                        # tuyệt đối không được âm thầm xóa mất một câu chưa dịch.
+                        if is_new_sentence and self.accumulated_text and self.accumulated_text != self.last_translated:
+                            flush_text = self.accumulated_text
+                            print(f"[Flush câu bị AUTO chuyển quá nhanh]: {flush_text}")
+                            self.last_translated = flush_text
+                            self.req_id += 1
+                            self.new_subtitle_ready.emit("⏳ Đang dịch...")
+                            Thread(
+                                target=self.translate_task,
+                                args=(flush_text, self.req_id),
+                                daemon=True
+                            ).start()
 
                         if merged_text != self.accumulated_text:
                             self.accumulated_text = merged_text
